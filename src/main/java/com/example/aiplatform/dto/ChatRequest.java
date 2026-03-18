@@ -29,4 +29,7 @@ public class ChatRequest {
 
     /** 指定使用的AI模型（可选） */
     private String model;
+
+    /** AI服务提供商（可选，默认使用系统配置） */
+    private String provider;
 }

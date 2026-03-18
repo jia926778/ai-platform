@@ -28,6 +28,12 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+  elasticsearch:
+    uris: ${ES_URIS:http://localhost:9200}
+    username: ${ES_USERNAME:}
+    password: ${ES_PASSWORD:}
+    connection-timeout: 5s
+    socket-timeout: 30s
   sql:
     init:
       mode: always
@@ -41,3 +47,18 @@ app:
   rate-limit:
     default-limit: 100
     default-duration: 3600
+  # 多AI提供商配置
+  ai:
+    default-provider: OPENAI
+    claude:
+      enabled: ${CLAUDE_ENABLED:false}
+      api-key: ${CLAUDE_API_KEY:}
+      base-url: ${CLAUDE_BASE_URL:https://api.anthropic.com}
+    qianwen:
+      enabled: ${QIANWEN_ENABLED:false}
+      api-key: ${QIANWEN_API_KEY:}
+      base-url: ${QIANWEN_BASE_URL:https://dashscope.aliyuncs.com}
+
+# Spring Retry 配置
+spring.retry:
+  enabled: true

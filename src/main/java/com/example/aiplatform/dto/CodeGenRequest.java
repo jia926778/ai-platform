@@ -32,4 +32,7 @@ public class CodeGenRequest {
 
     /** 使用的框架（可选，如：Spring Boot、React等） */
     private String framework;
+
+    /** AI服务提供商（可选，默认使用系统配置） */
+    private String provider;
 }

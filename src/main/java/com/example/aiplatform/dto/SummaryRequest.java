@@ -26,4 +26,7 @@ public class SummaryRequest {
 
     /** 摘要最大长度限制（可选） */
     private Integer maxLength;
+
+    /** AI服务提供商（可选，默认使用系统配置） */
+    private String provider;
 }

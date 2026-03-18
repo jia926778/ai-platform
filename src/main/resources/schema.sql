@@ -92,3 +92,30 @@ SELECT u.id, r.id FROM sys_user u, sys_role r WHERE u.username = 'admin' AND r.r
 -- Also assign user role to admin
 INSERT IGNORE INTO sys_user_role (user_id, role_id)
 SELECT u.id, r.id FROM sys_user u, sys_role r WHERE u.username = 'admin' AND r.role_code = 'ROLE_USER';
+
+-- AI请求日志表（记录完整请求/响应内容，支持追溯与分析）
+CREATE TABLE IF NOT EXISTS ai_request_log (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    user_id BIGINT NOT NULL COMMENT '用户ID',
+    username VARCHAR(50) COMMENT '用户名（冗余字段）',
+    api_type VARCHAR(30) NOT NULL COMMENT 'API类型：CHAT/SUMMARY/CODEGEN',
+    model VARCHAR(50) COMMENT '使用的AI模型',
+    provider VARCHAR(30) COMMENT 'AI服务提供商',
+    request_content MEDIUMTEXT COMMENT '请求内容（用户输入）',
+    response_content MEDIUMTEXT COMMENT '响应内容（AI输出）',
+    system_prompt TEXT COMMENT '系统提示词',
+    prompt_tokens INT DEFAULT 0 COMMENT '提示词Token数',
+    completion_tokens INT DEFAULT 0 COMMENT '生成内容Token数',
+    total_tokens INT DEFAULT 0 COMMENT '总Token消耗',
+    duration_ms BIGINT DEFAULT 0 COMMENT '请求耗时（毫秒）',
+    status VARCHAR(20) NOT NULL COMMENT '请求状态：SUCCESS/FAILED',
+    error_message TEXT COMMENT '错误信息',
+    client_ip VARCHAR(50) COMMENT '客户端IP',
+    conversation_id BIGINT COMMENT '会话ID',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    INDEX idx_request_user_id (user_id),
+    INDEX idx_request_api_type (api_type),
+    INDEX idx_request_status (status),
+    INDEX idx_request_created_at (created_at),
+    INDEX idx_request_provider (provider)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI请求日志表';

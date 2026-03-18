@@ -1,5 +1,10 @@
 package com.example.aiplatform.service;
 
+import com.example.aiplatform.ai.AiMessage;
+import com.example.aiplatform.ai.AiProvider;
+import com.example.aiplatform.ai.AiProviderManager;
+import com.example.aiplatform.ai.AiRequest;
+import com.example.aiplatform.ai.AiResponse;
 import com.example.aiplatform.dto.ChatRequest;
 import com.example.aiplatform.dto.ChatResponse;
 import com.example.aiplatform.entity.ApiUsageLog;
@@ -9,12 +14,7 @@ import com.example.aiplatform.exception.BusinessException;
 import com.example.aiplatform.repository.ApiUsageLogRepository;
 import com.example.aiplatform.repository.ChatConversationRepository;
 import com.example.aiplatform.repository.ChatMessageRepository;
-import org.springframework.ai.chat.messages.AssistantMessage;
-import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.SystemMessage;
-import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.prompt.Prompt;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,6 +22,7 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 聊天服务类
@@ -29,16 +30,18 @@ import java.util.List;
  * 提供AI聊天对话功能，包括发送消息、获取会话列表、获取消息历史和删除会话。
  * 每次聊天调用都会记录到API使用日志中，用于用量统计和费用核算。
  * 支持多轮对话，通过会话历史构建上下文传递给AI模型。
+ * 通过AiProviderManager支持多AI提供商适配和故障转移。
  * </p>
  *
  * @author AI Platform
  * @since 1.0.0
  */
+@Slf4j
 @Service
 public class ChatService {
 
-    /** Spring AI聊天模型 */
-    private final ChatModel chatModel;
+    /** AI服务提供商管理器 */
+    private final AiProviderManager aiProviderManager;
     /** 会话数据访问 */
     private final ChatConversationRepository conversationRepository;
     /** 消息数据访问 */
@@ -46,22 +49,23 @@ public class ChatService {
     /** API使用日志数据访问 */
     private final ApiUsageLogRepository usageLogRepository;
 
-    public ChatService(ChatModel chatModel,
+    public ChatService(AiProviderManager aiProviderManager,
                        ChatConversationRepository conversationRepository,
                        ChatMessageRepository messageRepository,
                        ApiUsageLogRepository usageLogRepository) {
-        this.chatModel = chatModel;
+        this.aiProviderManager = aiProviderManager;
         this.conversationRepository = conversationRepository;
         this.messageRepository = messageRepository;
         this.usageLogRepository = usageLogRepository;
     }
 
     /**
-     * 发送聊天消息并获取AI回复
+     * 发送聊天消息并获取AI回复（同步）
      * <p>
      * 如果指定了会话ID则在已有会话中继续对话，否则创建新会话。
      * 将用户消息保存后，构建完整对话历史作为上下文调用AI模型，
      * 最后保存AI回复并记录API使用日志。
+     * 通过AiProviderManager按模型或提供商名称路由到对应的AI服务提供商。
      * </p>
      *
      * @param userId  当前用户ID
@@ -102,19 +106,24 @@ public class ChatService {
                 .build();
         messageRepository.save(userMessage);
 
-        // 构建对话历史上下文（包含系统提示词和所有历史消息）
+        // 构建对话历史上下文（转换为统一AiMessage格式）
         List<ChatMessage> history = messageRepository.findByConversationIdOrderByCreatedAtAsc(conversation.getId());
-        List<Message> messages = new ArrayList<>();
-        messages.add(new SystemMessage("You are a helpful AI assistant."));
+        List<AiMessage> aiMessages = new ArrayList<>();
         for (ChatMessage msg : history) {
-            switch (msg.getRole()) {
-                case "user" -> messages.add(new UserMessage(msg.getContent()));
-                case "assistant" -> messages.add(new AssistantMessage(msg.getContent()));
-                case "system" -> messages.add(new SystemMessage(msg.getContent()));
-            }
+            aiMessages.add(AiMessage.builder()
+                    .role(msg.getRole())
+                    .content(msg.getContent())
+                    .build());
         }
 
-        // 调用AI模型获取回复
+        // 构建统一AI请求
+        AiRequest aiRequest = AiRequest.builder()
+                .systemPrompt("You are a helpful AI assistant.")
+                .messages(aiMessages)
+                .model(request.getModel())
+                .build();
+
+        // 通过AiProviderManager路由到对应提供商并调用
         String assistantContent;
         Integer totalTokens = 0;
         Integer promptTokens = 0;
@@ -123,15 +132,27 @@ public class ChatService {
         String errorMsg = null;
 
         try {
-            Prompt prompt = new Prompt(messages);
-            org.springframework.ai.chat.model.ChatResponse aiResponse = chatModel.call(prompt);
-            assistantContent = aiResponse.getResult().getOutput().getContent();
+            AiProvider provider;
+            if (request.getProvider() != null && !request.getProvider().isEmpty()) {
+                // 按指定提供商名称获取
+                provider = aiProviderManager.getProvider(request.getProvider());
+            } else {
+                // 按模型名称自动匹配提供商
+                provider = aiProviderManager.getProviderByModel(request.getModel());
+            }
 
-            // 提取token用量信息
-            if (aiResponse.getMetadata() != null && aiResponse.getMetadata().getUsage() != null) {
-                promptTokens = (int) aiResponse.getMetadata().getUsage().getPromptTokens();
-                completionTokens = (int) aiResponse.getMetadata().getUsage().getGenerationTokens();
-                totalTokens = promptTokens + completionTokens;
+            AiResponse aiResponse = provider.chat(aiRequest);
+
+            if (aiResponse.isSuccess()) {
+                assistantContent = aiResponse.getContent();
+                promptTokens = aiResponse.getPromptTokens();
+                completionTokens = aiResponse.getCompletionTokens();
+                totalTokens = aiResponse.getTotalTokens();
+            } else {
+                // AI提供商返回失败响应
+                status = "error";
+                errorMsg = aiResponse.getErrorMessage();
+                assistantContent = "Sorry, an error occurred while processing your request: " + aiResponse.getErrorMessage();
             }
         } catch (Exception e) {
             // AI调用失败时记录错误并返回错误提示
@@ -177,6 +198,20 @@ public class ChatService {
                 .tokens(totalTokens)
                 .conversationTitle(conversation.getTitle())
                 .build();
+    }
+
+    /**
+     * 异步发送聊天消息并获取AI回复
+     * <p>
+     * 使用AI提供商的异步接口调用，适用于不需要立即返回结果的场景。
+     * </p>
+     *
+     * @param userId  当前用户ID
+     * @param request 聊天请求参数
+     * @return CompletableFuture包装的聊天响应
+     */
+    public CompletableFuture<ChatResponse> sendMessageAsync(Long userId, ChatRequest request) {
+        return CompletableFuture.supplyAsync(() -> sendMessage(userId, request));
     }
 
     /**

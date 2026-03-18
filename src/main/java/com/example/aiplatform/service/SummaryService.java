@@ -1,18 +1,19 @@
 package com.example.aiplatform.service;
 
+import com.example.aiplatform.ai.AiProvider;
+import com.example.aiplatform.ai.AiProviderManager;
+import com.example.aiplatform.ai.AiRequest;
+import com.example.aiplatform.ai.AiResponse;
 import com.example.aiplatform.dto.SummaryRequest;
 import com.example.aiplatform.dto.SummaryResponse;
 import com.example.aiplatform.entity.ApiUsageLog;
 import com.example.aiplatform.repository.ApiUsageLogRepository;
-import org.springframework.ai.chat.messages.SystemMessage;
-import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.prompt.Prompt;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 文本摘要服务类
@@ -20,28 +21,31 @@ import java.util.List;
  * 调用AI模型对用户提交的长文本生成摘要。
  * 支持自定义摘要最大长度限制，并计算压缩比。
  * 每次调用都会记录API使用日志。
+ * 通过AiProviderManager支持多AI提供商适配和故障转移。
  * </p>
  *
  * @author AI Platform
  * @since 1.0.0
  */
+@Slf4j
 @Service
 public class SummaryService {
 
-    /** Spring AI聊天模型 */
-    private final ChatModel chatModel;
+    /** AI服务提供商管理器 */
+    private final AiProviderManager aiProviderManager;
     /** API使用日志数据访问 */
     private final ApiUsageLogRepository usageLogRepository;
 
-    public SummaryService(ChatModel chatModel, ApiUsageLogRepository usageLogRepository) {
-        this.chatModel = chatModel;
+    public SummaryService(AiProviderManager aiProviderManager, ApiUsageLogRepository usageLogRepository) {
+        this.aiProviderManager = aiProviderManager;
         this.usageLogRepository = usageLogRepository;
     }
 
     /**
-     * 生成文本摘要
+     * 生成文本摘要（同步）
      * <p>
      * 将原始文本发送给AI模型进行摘要生成，返回摘要内容及相关统计信息。
+     * 通过AiProviderManager按提供商名称路由到对应的AI服务提供商。
      * </p>
      *
      * @param userId  当前用户ID（用于记录使用日志）
@@ -54,14 +58,15 @@ public class SummaryService {
                 ? " Keep the summary under " + request.getMaxLength() + " characters."
                 : " Keep the summary concise.";
 
-        // 构建系统提示词和用户消息
-        SystemMessage systemMessage = new SystemMessage(
-                "You are a professional text summarization assistant. " +
-                "Provide clear, concise summaries that capture the key points." + maxLengthInstruction);
-        UserMessage userMessage = new UserMessage(
-                "Please summarize the following text:\n\n" + request.getText());
+        // 构建系统提示词
+        String systemPrompt = "You are a professional text summarization assistant. " +
+                "Provide clear, concise summaries that capture the key points." + maxLengthInstruction;
 
-        Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
+        // 构建统一AI请求
+        AiRequest aiRequest = AiRequest.builder()
+                .systemPrompt(systemPrompt)
+                .userMessage("Please summarize the following text:\n\n" + request.getText())
+                .build();
 
         String summaryText;
         int totalTokens = 0;
@@ -69,17 +74,29 @@ public class SummaryService {
         int completionTokens = 0;
         String status = "success";
         String errorMsg = null;
+        String modelUsed = "gpt-3.5-turbo";
 
         try {
-            // 调用AI模型生成摘要
-            org.springframework.ai.chat.model.ChatResponse aiResponse = chatModel.call(prompt);
-            summaryText = aiResponse.getResult().getOutput().getContent();
+            // 通过AiProviderManager路由到对应提供商并调用
+            AiProvider provider;
+            if (request.getProvider() != null && !request.getProvider().isEmpty()) {
+                provider = aiProviderManager.getProvider(request.getProvider());
+            } else {
+                provider = aiProviderManager.getDefaultProvider();
+            }
 
-            // 提取token用量信息
-            if (aiResponse.getMetadata() != null && aiResponse.getMetadata().getUsage() != null) {
-                promptTokens = (int) aiResponse.getMetadata().getUsage().getPromptTokens();
-                completionTokens = (int) aiResponse.getMetadata().getUsage().getGenerationTokens();
-                totalTokens = promptTokens + completionTokens;
+            AiResponse aiResponse = provider.chat(aiRequest);
+
+            if (aiResponse.isSuccess()) {
+                summaryText = aiResponse.getContent();
+                promptTokens = aiResponse.getPromptTokens();
+                completionTokens = aiResponse.getCompletionTokens();
+                totalTokens = aiResponse.getTotalTokens();
+                modelUsed = aiResponse.getModel() != null ? aiResponse.getModel() : modelUsed;
+            } else {
+                status = "error";
+                errorMsg = aiResponse.getErrorMessage();
+                summaryText = "Failed to generate summary: " + aiResponse.getErrorMessage();
             }
         } catch (Exception e) {
             status = "error";
@@ -91,7 +108,7 @@ public class SummaryService {
         ApiUsageLog usageLog = ApiUsageLog.builder()
                 .userId(userId)
                 .apiType("summary")
-                .model("gpt-3.5-turbo")
+                .model(modelUsed)
                 .promptTokens(promptTokens)
                 .completionTokens(completionTokens)
                 .totalTokens(totalTokens)
@@ -115,5 +132,19 @@ public class SummaryService {
                 .summaryLength(summaryLength)
                 .compressionRatio(Math.round(compressionRatio * 100.0) / 100.0)
                 .build();
+    }
+
+    /**
+     * 异步生成文本摘要
+     * <p>
+     * 使用AI提供商的异步接口调用，适用于不需要立即返回结果的场景。
+     * </p>
+     *
+     * @param userId  当前用户ID
+     * @param request 摘要请求参数
+     * @return CompletableFuture包装的摘要响应
+     */
+    public CompletableFuture<SummaryResponse> generateSummaryAsync(Long userId, SummaryRequest request) {
+        return CompletableFuture.supplyAsync(() -> generateSummary(userId, request));
     }
 }
